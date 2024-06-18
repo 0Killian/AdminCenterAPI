@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use axum::{response::IntoResponse, routing::get};
 use serde::{Deserialize, Serialize};
+use session_store::{SqlxPool, SqlxSessionStore};
+use sqlx::{MySqlPool, PgPool, SqlitePool};
 use tokio::{signal, task::AbortHandle};
 use tower_sessions::{
     cookie::time::Duration, session_store::ExpiredDeletion, Session, SessionManagerLayer,
-    SessionStore,
-};
-use tower_sessions_sqlx_store::{
-    sqlx::{Database, MySql, Pool, Postgres, Sqlite},
-    MySqlStore, PostgresStore, SqliteStore,
 };
 
 mod config;
+mod session_store;
 
 // States
 #[derive(Serialize, Deserialize, Default)]
@@ -37,21 +35,43 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     let config = config::Config::from_env()?;
 
-    // Describe the application
-    let app = axum::Router::new().route("/", get(index));
-
-    // Hook up the session manager
-    let (app, deletion_task) = match &config.database_uri {
-        config::DatabaseUri::Sqlite(_) => {
-            hook_session_manager::<Sqlite, SqliteStore>(&config, app).await?
-        }
+    // Connect to the database
+    let pool = match config.database_uri {
+        config::DatabaseUri::Sqlite(_) => SqlxPool::Sqlite(
+            SqlitePool::connect(&config.database_uri.get_connection_string()).await?,
+        ),
         config::DatabaseUri::Postgres(_) => {
-            hook_session_manager::<Postgres, PostgresStore>(&config, app).await?
+            SqlxPool::Postgres(PgPool::connect(&config.database_uri.get_connection_string()).await?)
         }
         config::DatabaseUri::Mysql(_) => {
-            hook_session_manager::<MySql, MySqlStore>(&config, app).await?
+            SqlxPool::MySql(MySqlPool::connect(&config.database_uri.get_connection_string()).await?)
         }
     };
+
+    // Create the session store
+    let store = SqlxSessionStore::new(pool.clone());
+
+    store
+        .migrate()
+        .await
+        .with_context(|| "Failed to migrate session store")?;
+
+    let deletion_task = tokio::task::spawn(
+        store
+            .clone()
+            .continuously_delete_expired(tokio::time::Duration::from_secs(60)),
+    );
+
+    let session_layer = SessionManagerLayer::new(store)
+        .with_secure(SESSION_LAYER_SECURE)
+        .with_expiry(tower_sessions::Expiry::OnInactivity(
+            SESSION_STORE_EXPIRATION,
+        ));
+
+    // Describe the application
+    let app = axum::Router::new()
+        .route("/", get(index))
+        .layer(session_layer);
 
     // Start the server
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", config.host, config.port))
@@ -92,83 +112,4 @@ async fn shutdown_signal(abort_handle: AbortHandle) {
         _ = ctrl_c => { abort_handle.abort() },
         _ = terminate => { abort_handle.abort() },
     }
-}
-
-// NOTE: tower_sessions_sqlx_store does not provide a way to use the pools and session stores "dynamically"
-// (meaning that each type of database has its own pool and session store type). The following code serve
-// as a workaround for this.
-
-// TODO: Find a better method for this...
-trait SessionStoreFromPool<DB>: SessionStore + ExpiredDeletion + Clone
-where
-    DB: Database,
-{
-    fn new(pool: Pool<DB>) -> Self;
-    async fn migrate(&self) -> tower_sessions_sqlx_store::sqlx::Result<()>;
-}
-
-impl SessionStoreFromPool<Sqlite> for SqliteStore {
-    fn new(pool: Pool<Sqlite>) -> Self {
-        SqliteStore::new(pool)
-    }
-
-    async fn migrate(&self) -> tower_sessions_sqlx_store::sqlx::Result<()> {
-        SqliteStore::migrate(self).await
-    }
-}
-
-impl SessionStoreFromPool<Postgres> for PostgresStore {
-    fn new(pool: Pool<Postgres>) -> Self {
-        PostgresStore::new(pool)
-    }
-
-    async fn migrate(&self) -> tower_sessions_sqlx_store::sqlx::Result<()> {
-        PostgresStore::migrate(self).await
-    }
-}
-
-impl SessionStoreFromPool<MySql> for MySqlStore {
-    fn new(pool: Pool<MySql>) -> Self {
-        MySqlStore::new(pool)
-    }
-
-    async fn migrate(&self) -> tower_sessions_sqlx_store::sqlx::Result<()> {
-        MySqlStore::migrate(self).await
-    }
-}
-
-async fn hook_session_manager<DB, S>(
-    config: &config::Config,
-    app: axum::Router,
-) -> Result<(
-    axum::Router,
-    tokio::task::JoinHandle<tower_sessions::session_store::Result<()>>,
-)>
-where
-    DB: Database,
-    S: SessionStoreFromPool<DB>,
-{
-    let pool = Pool::<DB>::connect(&config.database_uri.get_connection_string())
-        .await
-        .context("Failed to connect to sqlite database")?;
-    let store = S::new(pool.clone());
-
-    store
-        .migrate()
-        .await
-        .with_context(|| "Failed to migrate session store")?;
-
-    let deletion_task = tokio::task::spawn(
-        store
-            .clone()
-            .continuously_delete_expired(tokio::time::Duration::from_secs(60)),
-    );
-
-    let session_layer = SessionManagerLayer::new(store)
-        .with_secure(SESSION_LAYER_SECURE)
-        .with_expiry(tower_sessions::Expiry::OnInactivity(
-            SESSION_STORE_EXPIRATION,
-        ));
-
-    Ok((app.layer(session_layer), deletion_task))
 }
