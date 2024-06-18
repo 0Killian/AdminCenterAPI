@@ -37,15 +37,21 @@ async fn main() -> Result<()> {
 
     // Connect to the database
     let pool = match config.database_uri {
-        config::DatabaseUri::Sqlite(_) => SqlxPool::Sqlite(
-            SqlitePool::connect(&config.database_uri.get_connection_string()).await?,
-        ),
-        config::DatabaseUri::Postgres(_) => {
-            SqlxPool::Postgres(PgPool::connect(&config.database_uri.get_connection_string()).await?)
-        }
-        config::DatabaseUri::Mysql(_) => {
-            SqlxPool::MySql(MySqlPool::connect(&config.database_uri.get_connection_string()).await?)
-        }
+        config::DatabaseUri::Sqlite(_) => SqlxPool::Sqlite({
+            let pool = SqlitePool::connect(&config.database_uri.get_connection_string()).await?;
+            sqlx::migrate!("migrations/sqlite").run(&pool).await?;
+            pool
+        }),
+        config::DatabaseUri::Postgres(_) => SqlxPool::Postgres({
+            let pool = PgPool::connect(&config.database_uri.get_connection_string()).await?;
+            sqlx::migrate!("migrations/postgres").run(&pool).await?;
+            pool
+        }),
+        config::DatabaseUri::Mysql(_) => SqlxPool::MySql({
+            let pool = MySqlPool::connect(&config.database_uri.get_connection_string()).await?;
+            sqlx::migrate!("migrations/mysql").run(&pool).await?;
+            pool
+        }),
     };
 
     // Create the session store
